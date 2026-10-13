@@ -1,0 +1,60 @@
+name: Build OpenVision v2.14.0 IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: xcode-27
+    steps:
+      - name: Get OpenVision v2.14.0 source
+        uses: actions/checkout@v4
+        with:
+          repository: rayl15/OpenVision
+          ref: v2.14.0
+          persist-credentials: false
+
+      - name: Prepare Xcode tools
+        run: |
+          brew install xcodegen
+          xcodebuild -downloadComponent MetalToolchain
+
+      - name: Prepare application configuration
+        env:
+          META_APP_ID: ${{ secrets.META_APP_ID }}
+          META_CLIENT_TOKEN: ${{ secrets.META_CLIENT_TOKEN }}
+          OPENVISION_BUNDLE_ID: ${{ vars.OPENVISION_BUNDLE_ID }}
+        run: |
+          cp OpenVision/Config/Config.swift.example OpenVision/Config/Config.swift
+          printf 'DEVELOPMENT_TEAM =\nPRODUCT_BUNDLE_IDENTIFIER = %s\nMETA_APP_ID = %s\nCLIENT_TOKEN = %s\nAPP_LINK_URL_SCHEME = openvision\n' \
+            "${OPENVISION_BUNDLE_ID:-com.example.openvision}" \
+            "${META_APP_ID:-0}" \
+            "${META_CLIENT_TOKEN:-AR|0|placeholder}" > Config.xcconfig
+          xcodegen generate
+
+      - name: Build for physical iPhone (no signing)
+        run: |
+          xcodebuild \
+            -project OpenVision.xcodeproj \
+            -scheme OpenVision \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath build/DerivedData \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package IPA
+        run: |
+          mkdir -p Payload
+          cp -R build/DerivedData/Build/Products/Release-iphoneos/OpenVision.app Payload/
+          ditto -c -k --keepParent Payload OpenVision-v2.14.0-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVision-v2.14.0-unsigned
+          path: OpenVision-v2.14.0-unsigned.ipa
+          if-no-files-found: error
