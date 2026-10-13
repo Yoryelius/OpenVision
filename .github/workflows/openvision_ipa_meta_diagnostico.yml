@@ -1,0 +1,141 @@
+# Guardar en tu fork como .github/workflows/openvision_ipa_meta_diagnostico.yml
+# Configurar en Settings > Secrets and variables > Actions:
+# Secrets: KRAVA_TEAM_ID (TeamIdentifier del mobileprovision), META_APP_ID,
+#          META_CLIENT_TOKEN (incluye AR|APP_ID|HASH)
+# Variable: OPENVISION_BUNDLE_ID (debe conservarse al firmar con KravaSign)
+name: OpenVision - IPA unsigned + diagnostico Meta
+
+on:
+  workflow_dispatch:
+    inputs:
+      meta_mode:
+        description: "Developer para la primera prueba; Production solo tras registrar el proyecto en Meta"
+        required: true
+        type: choice
+        default: developer
+        options:
+          - developer
+          - production
+
+jobs:
+  build-ipa:
+    runs-on: xcode-27
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      MODE: ${{ inputs.meta_mode }}
+      TEAM_ID: ${{ secrets.KRAVA_TEAM_ID }}
+      BUNDLE_ID: ${{ vars.OPENVISION_BUNDLE_ID }}
+      META_REAL_APP_ID: ${{ secrets.META_APP_ID }}
+      META_CLIENT_TOKEN: ${{ secrets.META_CLIENT_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Preparar certificados NO (IPA se firmara en iPhone con KravaSign)
+        run: |
+          xcodebuild -version
+          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
+          if ! xcrun --find metal >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+
+      - name: Configuracion de proyecto y permisos del SDK
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, plistlib, re, pathlib
+          team = os.environ.get('TEAM_ID', '').strip()
+          bid = os.environ.get('BUNDLE_ID', '').strip()
+          real_app = os.environ.get('META_REAL_APP_ID', '').strip()
+          token = os.environ.get('META_CLIENT_TOKEN', '').strip()
+          mode = os.environ.get('MODE', 'developer')
+          assert re.fullmatch(r'[A-Z0-9]{10}', team), 'KRAVA_TEAM_ID debe ser TeamIdentifier de 10 caracteres'
+          assert re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]+', bid) and '.' in bid, 'OPENVISION_BUNDLE_ID no valido'
+          assert real_app.isdigit(), 'META_APP_ID debe ser un numero real de Meta Developer Center'
+          assert token.startswith('AR|' + real_app + '|') and len(token.split('|')) == 3, 'META_CLIENT_TOKEN debe ser AR|META_APP_ID|HASH'
+          assert mode in ('developer', 'production')
+          meta_id = '0' if mode == 'developer' else real_app
+          # No se suben credenciales al repositorio ni se imprimen en Actions.
+          pathlib.Path('Config.xcconfig').write_text(
+              f'DEVELOPMENT_TEAM = {team}\n'
+              f'PRODUCT_BUNDLE_IDENTIFIER = {bid}\n'
+              f'META_APP_ID = {meta_id}\n'
+              f'CLIENT_TOKEN = {token}\n'
+              f'APP_LINK_URL_SCHEME = openvision\n', encoding='utf-8')
+          sample = pathlib.Path('OpenVision/Config/Config.swift.example')
+          dest = pathlib.Path('OpenVision/Config/Config.swift')
+          if not dest.exists():
+              assert sample.exists(), 'No existe Config.swift.example'
+              dest.write_bytes(sample.read_bytes())
+          path = pathlib.Path('OpenVision/Resources/Info.plist')
+          with path.open('rb') as f:
+              p = plistlib.load(f)
+          p['NSLocalNetworkUsageDescription'] = 'OpenVision necesita encontrar y comunicarse con las gafas Meta a traves de la red local.'
+          p['NSBonjourServices'] = ['_bonjour._tcp']
+          with path.open('wb') as f:
+              plistlib.dump(p, f, sort_keys=False)
+          print('Configuracion generada; modo Meta:', mode, '| Bundle ID:', bid, '| Team ID:', team)
+          PY
+          # project.yml tambien utiliza sustitucion ${VAR}; exportar los valores
+          # garantiza que xcodegen NO genere placeholders ni un Team ID vacio.
+          export DEVELOPMENT_TEAM="$TEAM_ID"
+          export PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
+          if [ "$MODE" = "developer" ]; then
+            export META_APP_ID="0"
+          else
+            export META_APP_ID="$META_REAL_APP_ID"
+          fi
+          export CLIENT_TOKEN="$META_CLIENT_TOKEN"
+          export APP_LINK_URL_SCHEME="openvision"
+          xcodegen generate
+
+      - name: Compilar para dispositivo iOS SIN firma
+        shell: bash
+        run: |
+          set -o pipefail
+          xcodebuild \
+            -project OpenVision.xcodeproj \
+            -scheme OpenVision \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$PWD/DerivedData" \
+            -skipMacroValidation \
+            -skipPackagePluginValidation \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Verificar Info.plist COMPILADO y empaquetar IPA
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, plistlib, shutil, zipfile
+          app = pathlib.Path('DerivedData/Build/Products/Release-iphoneos/OpenVision.app')
+          assert app.exists(), 'No se genero OpenVision.app'
+          with (app/'Info.plist').open('rb') as f:
+              p = plistlib.load(f)
+          mw = p.get('MWDAT', {})
+          assert p.get('CFBundleIdentifier') == os.environ['BUNDLE_ID'], 'Bundle ID compilado distinto al configurado'
+          assert mw.get('TeamID') == os.environ['TEAM_ID'], 'MWDAT.TeamID no se expandio'
+          assert mw.get('MetaAppID') == ('0' if os.environ['MODE']=='developer' else os.environ['META_REAL_APP_ID']), 'MWDAT.MetaAppID no se expandio'
+          assert mw.get('ClientToken') == os.environ['META_CLIENT_TOKEN'], 'ClientToken no se expandio'
+          assert mw.get('AppLinkURLScheme') == 'openvision://', 'Callback del SDK invalido'
+          assert 'openvision' in [x for b in p.get('CFBundleURLTypes', []) for x in b.get('CFBundleURLSchemes', [])], 'Callback URL no registrado'
+          assert p.get('NSLocalNetworkUsageDescription') and '_bonjour._tcp' in p.get('NSBonjourServices', []), 'Faltan permisos de red local'
+          print('OK: verificadas configuracion MWDAT, bundle, callback y permisos EN EL IPA COMPILADO')
+          pathlib.Path('out').mkdir(exist_ok=True)
+          with zipfile.ZipFile('out/OpenVision-UNSIGNED.ipa','w',compression=zipfile.ZIP_DEFLATED) as z:
+              for f in app.rglob('*'):
+                  if f.is_file():
+                      z.write(f, str(pathlib.Path('Payload')/'OpenVision.app'/f.relative_to(app)))
+          PY
+
+      - name: Descargar IPA sin firmar
+        uses: actions/upload-artifact@v4
+        with:
+          name: OpenVision-IPA-UNSIGNED
+          path: out/OpenVision-UNSIGNED.ipa
+          if-no-files-found: error
+          retention-days: 7
