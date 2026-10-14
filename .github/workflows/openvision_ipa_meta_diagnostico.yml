@@ -19,11 +19,12 @@ on:
 
 jobs:
   build-ipa:
-    runs-on: xcode-27
+    runs-on: macos-26
     timeout-minutes: 120
     permissions:
       contents: read
     env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
       MODE: ${{ inputs.meta_mode }}
       TEAM_ID: ${{ secrets.KRAVA_TEAM_ID }}
       BUNDLE_ID: ${{ vars.OPENVISION_BUNDLE_ID }}
@@ -31,14 +32,34 @@ jobs:
       META_CLIENT_TOKEN: ${{ secrets.META_CLIENT_TOKEN }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Preparar certificados NO (IPA se firmara en iPhone con KravaSign)
+      - name: Preparar Xcode, XcodeGen y verificar MetalToolchain
+        shell: bash
         run: |
+          set -euo pipefail
           xcodebuild -version
-          if ! command -v xcodegen >/dev/null 2>&1; then brew install xcodegen; fi
-          if ! xcrun --find metal >/dev/null 2>&1; then
+          xcrun --sdk iphoneos --show-sdk-version
+          if ! command -v xcodegen >/dev/null 2>&1; then
+            brew install xcodegen
+          fi
+          # xcrun --find metal puede devolver una ruta AUN SIN el componente instalado.
+          # xcodebuild -showComponent reporta el estado real de MetalToolchain.
+          metal_status() {
+            xcodebuild -showComponent MetalToolchain 2>&1 \
+              | awk -F': *' '/^[[:space:]]*Status:/ { print tolower($2); exit }' \
+              | tr -d '\r'
+          }
+          status="$(metal_status)"
+          echo "MetalToolchain antes: ${status:-desconocido}"
+          if [[ "$status" != "installed" ]]; then
             xcodebuild -downloadComponent MetalToolchain
+            status="$(metal_status)"
+            echo "MetalToolchain despues: ${status:-desconocido}"
+            if [[ "$status" != "installed" ]]; then
+              echo "::error::MetalToolchain no aparece instalado. Revisa este paso."
+              exit 1
+            fi
           fi
 
       - name: Configuracion de proyecto y permisos del SDK
@@ -91,10 +112,12 @@ jobs:
           export APP_LINK_URL_SCHEME="openvision"
           xcodegen generate
 
-      - name: Compilar para dispositivo iOS SIN firma
+      - name: Compilar para dispositivo iOS SIN firma y resumir errores
         shell: bash
         run: |
           set -o pipefail
+          # Guardamos la salida y preservamos el codigo real de xcodebuild.
+          set +e
           xcodebuild \
             -project OpenVision.xcodeproj \
             -scheme OpenVision \
@@ -105,7 +128,17 @@ jobs:
             -skipMacroValidation \
             -skipPackagePluginValidation \
             CODE_SIGNING_ALLOWED=NO \
-            build
+            CODE_SIGNING_REQUIRED=NO \
+            build 2>&1 | tee "$RUNNER_TEMP/openvision-build.log"
+          result=${PIPESTATUS[0]}
+          set -e
+          if [ "$result" -ne 0 ]; then
+            echo "::group::DIAGNOSTICO: errores principales de xcodebuild"
+            grep -nE 'error:|fatal error:|BUILD FAILED|cannot execute tool|No such module|CompileMetalFile|SwiftCompile failed|package resolution failed' "$RUNNER_TEMP/openvision-build.log" | tail -n 90 || true
+            echo "::endgroup::"
+            echo "::error::xcodebuild fallo (codigo $result). Revisa el grupo DIAGNOSTICO inmediatamente arriba."
+            exit "$result"
+          fi
 
       - name: Verificar Info.plist COMPILADO y empaquetar IPA
         shell: bash
@@ -133,7 +166,7 @@ jobs:
           PY
 
       - name: Descargar IPA sin firmar
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: OpenVision-IPA-UNSIGNED
           path: out/OpenVision-UNSIGNED.ipa
